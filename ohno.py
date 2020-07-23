@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 _patch_cache = {}
 module_allow_list = {'qtpy.', 'PyQt5.'}
-func_ban_list = {
+ban_list = {
     '__getattribute__',
     '__setattribute__',
     '__getattr__',
@@ -29,6 +29,10 @@ func_ban_list = {
     'singleShot',  # safe
     # 'exec_',  # hmmm...
     'scale',  # hmm? why?
+
+    # TODO: only include QtWidgets/QtGui?
+    'QThread',
+    'QMutexLocker',
 }
 
 
@@ -100,7 +104,7 @@ def _seems_like_a_staticmethod_exception(ex):
 
     markers = ['arguments did not match any overloaded call',
                'too many arguments',
-               'has an unexpected type'
+               'argument 1 has unexpected type',
                ]
     text = str(ex).strip()
     return any(marker in text for marker in markers)
@@ -124,7 +128,7 @@ def _patch_function(owner, obj_attr, func):
 
 
 def should_patch(owner, obj_attr, obj):
-    if obj_attr in func_ban_list:
+    if obj_attr in ban_list:
         return False
 
     module = inspect.getmodule(owner)
