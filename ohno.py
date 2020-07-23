@@ -1,7 +1,9 @@
 import inspect
 import logging
+import runpy
 import sys
 import threading
+import types
 
 import qtpy
 import qtpy.QtCore  # noqa
@@ -25,48 +27,93 @@ func_ban_list = {
     '__str__',
     'emit',  # safe
     'singleShot',  # safe
-    'singleShot',  # safe
-    'exec_',  # hmmm...
+    # 'exec_',  # hmmm...
+    'scale',  # hmm? why?
 }
 
 
-def is_wrapped(func):
-    return getattr(func, '_is_wrapped_', False)
+class _WrappedMethod:
+    def __init__(self, owner, func):
+        self.owner = owner
+        self.unbound_func = func
+        self.bound_func = types.MethodType(func, owner)
+
+    def __getattr__(self, attr):
+        return getattr(self.unbound_func, attr)
+
+    def __setattr__(self, attr, value):
+        if attr in ('owner', 'unbound_func', 'bound_func'):
+            self.__dict__[attr] = value
+            return
+
+        setattr(self.unbound_func, attr, value)
+
+    def __call__(self, *args, **kwargs):
+        current_thread = threading.current_thread()
+        if current_thread != MAIN_THREAD:
+            caller = inspect.stack()[1]
+            caller_code = ''.join(caller.code_context).strip()
+            caller_location = (
+                f'{caller.filename}[{caller.function}:{caller.lineno}]'
+            )
+            logger.warning(
+                '%s in thread %r |%s| calling %s(%s%s)',
+                caller_location,
+                current_thread.name,
+                caller_code,
+                self.bound_func.__name__,
+                ', '.join(repr(arg) for arg in args),
+                ', '.join(f'{k}={v!r}' for k, v in kwargs.items()),
+            )
+
+        try:
+            return self.bound_func(*args, **kwargs)
+        except TypeError as ex:
+            # blarg, no better way to do this? `inspect` fails for builtins
+            if _seems_like_a_staticmethod_exception(ex):
+                return self.unbound_func(*args, **kwargs)
+            raise
+
+
+class _WrappedDescriptor:
+    def __init__(self, func):
+        self.func = func
+        self.bound = {}
+
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+
+    def __get__(self, obj, cls=None):
+        if obj is None:
+            return self.func
+
+        return _WrappedMethod(obj, self.func)
+
+
+def _function_wrapper(func, owner, attr):
+    return _WrappedDescriptor(func)
+
+
+def _seems_like_a_staticmethod_exception(ex):
+    if not isinstance(ex, TypeError):
+        return False
+
+    markers = ['arguments did not match any overloaded call',
+               'too many arguments',
+               'has an unexpected type'
+               ]
+    text = str(ex).strip()
+    return any(marker in text for marker in markers)
 
 
 def _patch_function(owner, obj_attr, func):
     key = (owner, obj_attr)
-    if key in _patch_cache or is_wrapped(func):
+    if key in _patch_cache:
         return
-
-    def wrapper(_orig_info):
-        func = _orig_info['func']
-
-        def wrapped(*args, **kwargs):
-            current_thread = threading.current_thread()
-            if current_thread != MAIN_THREAD:
-                caller = inspect.stack()[1]
-                caller_code = ''.join(caller.code_context).strip()
-                caller_location = (
-                    f'{caller.filename}[{caller.function}:{caller.lineno}]'
-                )
-                logger.warning(
-                    '%s in thread %r |%s| calling %s(%s%s)',
-                    caller_location,
-                    current_thread.name,
-                    caller_code,
-                    func.__name__,
-                    ', '.join(repr(arg) for arg in args),
-                    ', '.join(f'{k}={v!r}' for k, v in kwargs.items()),
-                )
-            return func(*args, **kwargs)
-
-        wrapped._is_wrapped_ = True
-        return wrapped
 
     info = dict(func=func, owner=owner, attr=obj_attr)
     try:
-        wrapped = wrapper(info)
+        wrapped = _function_wrapper(**info)
         setattr(owner, obj_attr, wrapped)
     except Exception as ex:
         if not obj_attr.startswith('__'):
@@ -87,6 +134,9 @@ def should_patch(owner, obj_attr, obj):
         return False
 
     if (owner, obj_attr) in _patch_cache:
+        return False
+
+    if isinstance(obj, qtpy.QtCore.Signal):
         return False
 
     if inspect.ismodule(obj):
@@ -120,26 +170,20 @@ def patch_modules(modules=None):
         for attr, child in inspect.getmembers(module):
             patch(module, attr, child)
 
-    assert qtpy.QtWidgets.QLabel.setText._is_wrapped_
 
+def main():
+    patch_modules()
 
-def test():
-    app = qtpy.QtWidgets.QApplication(sys.argv)
+    try:
+        argv0, script, *args = sys.argv
+    except ValueError:
+        print(f'Usage: {sys.argv[0]} (script.py) (args)')
+        sys.exit(1)
 
-    label = qtpy.QtWidgets.QLabel('my label')
-    label.setText('test')
-    label.text()
+    del sys.argv[1]
 
-    def oops():
-        label.setText('foobar')
-        print('text is', label.text())
-
-    th = threading.Thread(target=oops)
-    th.start()
-    th.join()
-    app.exec_()
+    runpy.run_path(script, init_globals=None, run_name='__main__')
 
 
 if __name__ == '__main__':
-    patch_modules()
-    test()
+    main()
