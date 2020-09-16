@@ -36,26 +36,25 @@ ban_list = {
 }
 
 
-class _WrappedMethod:
+class _WrappedBase:
     def __init__(self, owner, func):
         self.owner = owner
-        self.unbound_func = func
-        self.bound_func = types.MethodType(func, owner)
+        self.func = func
 
     def __getattr__(self, attr):
-        return getattr(self.unbound_func, attr)
+        return getattr(self.func, attr)
 
     def __setattr__(self, attr, value):
-        if attr in ('owner', 'unbound_func', 'bound_func'):
+        if attr in ('owner', 'func'):
             self.__dict__[attr] = value
             return
 
         setattr(self.unbound_func, attr, value)
 
-    def __call__(self, *args, **kwargs):
+    def _check_thread(self, args, kwargs):
         current_thread = threading.current_thread()
         if current_thread != MAIN_THREAD:
-            caller = inspect.stack()[1]
+            caller = inspect.stack()[2]
             caller_code = ''.join(caller.code_context).strip()
             caller_location = (
                 f'{caller.filename}[{caller.function}:{caller.lineno}]'
@@ -70,17 +69,31 @@ class _WrappedMethod:
                 ', '.join(f'{k}={v!r}' for k, v in kwargs.items()),
             )
 
-        try:
-            return self.bound_func(*args, **kwargs)
-        except TypeError as ex:
-            # blarg, no better way to do this? `inspect` fails for builtins
-            if _seems_like_a_staticmethod_exception(ex):
-                return self.unbound_func(*args, **kwargs)
-            raise
+
+class _WrappedStaticMethod(_WrappedBase):
+    def __init__(self, owner, func):
+        self.owner = owner
+        self.func = func
+
+    def __call__(self, *args, **kwargs):
+        self._check_thread(args, kwargs)
+        return self.func(*args, **kwargs)
+
+
+class _WrappedMethod(_WrappedBase):
+    def __init__(self, owner, func):
+        self.owner = owner
+        self.func = types.MethodType(func, owner)
+
+    def __call__(self, *args, **kwargs):
+        self._check_thread(args, kwargs)
+        return self.func(*args, **kwargs)
 
 
 class _WrappedDescriptor:
-    def __init__(self, func):
+    def __init__(self, owner, attr, func):
+        self.owner = owner
+        self.attr = attr
         self.func = func
         self.bound = {}
 
@@ -91,11 +104,13 @@ class _WrappedDescriptor:
         if obj is None:
             return self.func
 
-        return _WrappedMethod(obj, self.func)
-
-
-def _function_wrapper(func, owner, attr):
-    return _WrappedDescriptor(func)
+        print('attr', self.attr,
+              _method_names_by_class[obj.__class__.__name__],
+              self.attr in _method_names_by_class[self.owner.__name__]
+              )
+        if self.attr in _method_names_by_class[self.owner.__name__]:
+            return _WrappedMethod(obj, self.func)
+        return _WrappedStaticMethod(obj, self.func)
 
 
 def _seems_like_a_staticmethod_exception(ex):
@@ -117,7 +132,7 @@ def _patch_function(owner, obj_attr, func):
 
     info = dict(func=func, owner=owner, attr=obj_attr)
     try:
-        wrapped = _function_wrapper(**info)
+        wrapped = _WrappedDescriptor(**info)
         setattr(owner, obj_attr, wrapped)
     except Exception as ex:
         if not obj_attr.startswith('__'):
@@ -147,10 +162,12 @@ def should_patch(owner, obj_attr, obj):
         return False
 
     if inspect.isclass(obj):
-        # TODO: only patch Q* classes
-        return obj.__name__.startswith('Q')
+        return hasattr(obj, 'staticMetaObject')
 
     return True
+
+
+_method_names_by_class = {}
 
 
 def patch(owner, obj_attr, obj):
@@ -158,6 +175,13 @@ def patch(owner, obj_attr, obj):
         return
 
     if inspect.isclass(obj):
+        if obj.__name__ not in _method_names_by_class:
+            methods = [obj.staticMetaObject.method(idx)
+                       for idx in range(obj.staticMetaObject.methodCount())]
+            method_names = {method.name().data().decode('ascii')
+                            for method in methods}
+            _method_names_by_class[obj.__name__] = method_names
+
         for attr, child in inspect.getmembers(obj):
             patch(obj, attr, child)
     elif callable(obj) or inspect.ismethod(obj):
