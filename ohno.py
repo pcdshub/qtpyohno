@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 _patch_cache = {}
-module_allow_list = {'qtpy.', 'PyQt5.'}
 ban_list = {
     '__getattribute__',
     '__setattribute__',
@@ -27,8 +26,7 @@ ban_list = {
     '__str__',
     'emit',  # safe
     'singleShot',  # safe
-    # 'exec_',  # hmmm...
-    'scale',  # hmm? why?
+    # 'scale',  # hmm? why?
 
     # TODO: only include QtWidgets/QtGui?
     'QThread',
@@ -64,7 +62,7 @@ class _WrappedBase:
                 caller_location,
                 current_thread.name,
                 caller_code,
-                self.bound_func.__name__,
+                self.func.__name__,
                 ', '.join(repr(arg) for arg in args),
                 ', '.join(f'{k}={v!r}' for k, v in kwargs.items()),
             )
@@ -95,34 +93,30 @@ class _WrappedDescriptor:
         self.owner = owner
         self.attr = attr
         self.func = func
-        self.bound = {}
 
     def __call__(self, *args, **kwargs):
         return self.func(*args, **kwargs)
 
     def __get__(self, obj, cls=None):
         if obj is None:
+            # print('descriptor get', self.owner, self.attr, self.func)
             return self.func
 
-        print('attr', self.attr,
-              _method_names_by_class[obj.__class__.__name__],
-              self.attr in _method_names_by_class[self.owner.__name__]
-              )
-        if self.attr in _method_names_by_class[self.owner.__name__]:
+        if self.attr in _method_names_by_class[self.owner]:
             return _WrappedMethod(obj, self.func)
         return _WrappedStaticMethod(obj, self.func)
 
 
-def _seems_like_a_staticmethod_exception(ex):
-    if not isinstance(ex, TypeError):
-        return False
-
-    markers = ['arguments did not match any overloaded call',
-               'too many arguments',
-               'argument 1 has unexpected type',
-               ]
-    text = str(ex).strip()
-    return any(marker in text for marker in markers)
+def _add_class_to_cache(cls):
+    methods = [
+        cls.staticMetaObject.method(idx)
+        for idx in range(cls.staticMetaObject.methodCount())
+    ]
+    method_names = {
+        method.name().data().decode('ascii') for method in methods
+    }
+    _method_names_by_class[cls] = method_names
+    return method_names
 
 
 def _patch_function(owner, obj_attr, func):
@@ -134,35 +128,27 @@ def _patch_function(owner, obj_attr, func):
     try:
         wrapped = _WrappedDescriptor(**info)
         setattr(owner, obj_attr, wrapped)
-    except Exception as ex:
-        if not obj_attr.startswith('__'):
-            print("failed to patch", owner, obj_attr, ex)
+    except Exception:
         _patch_cache[key] = None
+        logger.exception('Failed to patch: %s %s', owner, obj_attr)
     else:
         _patch_cache[key] = wrapped
+
+
+_not_methods = (qtpy.QtCore.Signal, )
 
 
 def should_patch(owner, obj_attr, obj):
     if obj_attr in ban_list:
         return False
 
-    module = inspect.getmodule(owner)
-
-    if module is None or not any(module.__name__.startswith(allow)
-                                 for allow in module_allow_list):
-        return False
-
-    if (owner, obj_attr) in _patch_cache:
-        return False
-
-    if isinstance(obj, qtpy.QtCore.Signal):
-        return False
-
-    if inspect.ismodule(obj):
-        return False
-
     if inspect.isclass(obj):
         return hasattr(obj, 'staticMetaObject')
+
+    if owner in _method_names_by_class:
+        if isinstance(obj, _not_methods):
+            return False
+        return True
 
     return True
 
@@ -174,18 +160,14 @@ def patch(owner, obj_attr, obj):
     if not should_patch(owner, obj_attr, obj):
         return
 
-    if inspect.isclass(obj):
-        if obj.__name__ not in _method_names_by_class:
-            methods = [obj.staticMetaObject.method(idx)
-                       for idx in range(obj.staticMetaObject.methodCount())]
-            method_names = {method.name().data().decode('ascii')
-                            for method in methods}
-            _method_names_by_class[obj.__name__] = method_names
+    if inspect.isclass(obj) and hasattr(obj, 'staticMetaObject'):
+        if obj not in _method_names_by_class:
+            _add_class_to_cache(obj)
 
-        for attr, child in inspect.getmembers(obj):
-            patch(obj, attr, child)
-    elif callable(obj) or inspect.ismethod(obj):
-        _patch_function(owner, obj_attr, obj)
+        for attr in _method_names_by_class[obj]:
+            child = getattr(obj, attr, None)
+            if child is not None and should_patch(obj, attr, child):
+                _patch_function(obj, attr, child)
 
 
 def patch_modules(modules=None):
@@ -203,7 +185,7 @@ def main():
     patch_modules()
 
     try:
-        argv0, script, *args = sys.argv
+        _, script, *args = sys.argv
     except ValueError:
         print(f'Usage: {sys.argv[0]} (script.py) (args)')
         sys.exit(1)
